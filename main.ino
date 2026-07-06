@@ -1,194 +1,127 @@
-#include <Arduino_FreeRTOS.h>
-#include <task.h>
-
 #include <SPI.h>
 #include <LoRa.h>
-
 #include <DHT.h>
+#include <RS-FEC.h>
 
-//=============================
-// DHT
-//=============================
-#define DHTPIN      2
-#define DHTTYPE     DHT22
-
+//=========================
+// DHT22
+//=========================
+#define DHTPIN   2
+#define DHTTYPE  DHT22
 DHT dht(DHTPIN, DHTTYPE);
 
-//=============================
-// LoRa Pin
-//=============================
-#define LORA_SS     10
-#define LORA_RST    9
-#define LORA_DIO0   3
+//=========================
+// LoRa
+//=========================
+#define LORA_SS        10
+#define LORA_RST       9
+#define LORA_DIO0      3
 
-//=============================
-// LoRa Configuration
-//=============================
-#define LORA_FREQ          433E6
+#define LORA_FREQ      433E6
+#define LORA_TX_POWER  14
+#define LORA_SF        7
+#define LORA_BW        125E3
+#define LORA_CR        5
+#define LORA_SYNC      0x12
 
-#define LORA_SYNC_WORD     0xF3
-#define LORA_TX_POWER      17
+//=========================
+// Reed Solomon
+//=========================
+const uint8_t MSG_LEN   = 32;
+const uint8_t ECC_LEN   = 8;
+const uint8_t TOTAL_LEN = 40;
 
-#define LORA_SF            7
-#define LORA_BW            125E3
-#define LORA_CR            5
-#define LORA_PREAMBLE      8
+RS::ReedSolomon<MSG_LEN,ECC_LEN> rs;
 
-//=============================
-// Global Variable
-//=============================
-float suhu = 0.0;
-float hum  = 0.0;
+//=========================
+// Buffer
+//=========================
+char message[MSG_LEN];
+uint8_t encoded[TOTAL_LEN];
 
-//====================================================
-// Inisialisasi LoRa
-//====================================================
-bool initLoRa()
+//=========================
+void setup()
 {
-  LoRa.setPins(LORA_SS, LORA_RST, LORA_DIO0);
+    Serial.begin(115200);
 
-  if (!LoRa.begin(LORA_FREQ))
-  {
-    Serial.println("ERROR: LoRa Initialization Failed!");
-    return false;
-  }
+    dht.begin();
 
-  // Konfigurasi Radio
-  LoRa.setSyncWord(LORA_SYNC_WORD);
-  LoRa.setTxPower(LORA_TX_POWER);
+    LoRa.setPins(LORA_SS,LORA_RST,LORA_DIO0);
 
-  LoRa.setSpreadingFactor(LORA_SF);
-  LoRa.setSignalBandwidth(LORA_BW);
-  LoRa.setCodingRate4(LORA_CR);
+    if(!LoRa.begin(LORA_FREQ))
+    {
+        while(1);
+    }
 
-  LoRa.setPreambleLength(LORA_PREAMBLE);
-
-  LoRa.enableCrc();
-
-  Serial.println("--------------------------------");
-  Serial.println("LoRa Initialized Successfully");
-  Serial.print("Frequency : ");
-  Serial.println("433 MHz");
-
-  Serial.print("Sync Word : 0x");
-  Serial.println(LORA_SYNC_WORD, HEX);
-
-  Serial.print("SF         : ");
-  Serial.println(LORA_SF);
-
-  Serial.print("Bandwidth  : ");
-  Serial.println("125 kHz");
-
-  Serial.print("CodingRate : 4/");
-  Serial.println(LORA_CR);
-
-  Serial.println("--------------------------------");
-
-  return true;
+    LoRa.setTxPower(LORA_TX_POWER);
+    LoRa.setSpreadingFactor(LORA_SF);
+    LoRa.setSignalBandwidth(LORA_BW);
+    LoRa.setCodingRate4(LORA_CR);
+    LoRa.setSyncWord(LORA_SYNC);
+    LoRa.enableCrc();
 }
 
-//====================================================
-// Task Membaca DHT
-//====================================================
-void TaskReadDHT(void *pvParameters)
+void loop()
 {
-  (void) pvParameters;
-
-  while (1)
-  {
     float t = dht.readTemperature();
     float h = dht.readHumidity();
 
-    if (!isnan(t) && !isnan(h))
+    if (isnan(t) || isnan(h))
     {
-      suhu = t;
-      hum = h;
-
-      Serial.print("Temperature : ");
-      Serial.print(suhu);
-      Serial.print(" °C");
-
-      Serial.print("   Humidity : ");
-      Serial.print(hum);
-      Serial.println(" %");
-    }
-    else
-    {
-      Serial.println("DHT Read Failed");
+        Serial.println(F("DHT22 Error"));
+        delay(2000);
+        return;
     }
 
-    vTaskDelay(pdMS_TO_TICKS(2000));
-  }
-}
+    memset(message, 0, MSG_LEN);
 
-//====================================================
-// Task Kirim LoRa
-//====================================================
-void TaskLoRa(void *pvParameters)
-{
-  (void) pvParameters;
+    char tStr[8];
+    char hStr[8];
 
-  char payload[40];
+    dtostrf(t, 4, 1, tStr);
+    dtostrf(h, 4, 1, hStr);
 
-  while (1)
-  {
-    snprintf(payload, sizeof(payload),
-             "TEMP=%.1f,HUM=%.1f",
-             suhu,
-             hum);
+    snprintf(message,
+             MSG_LEN,
+             "{\"id\":3,\"t\":%s,\"h\":%s}",
+             tStr,
+             hStr);
 
+    // Encode Reed-Solomon
+    rs.Encode(message, encoded);
+
+    // Kirim LoRa
     LoRa.beginPacket();
-    LoRa.print(payload);
-    LoRa.endPacket();
+    LoRa.write(encoded, TOTAL_LEN);
+    bool status = LoRa.endPacket();
 
-    Serial.print("LoRa TX : ");
-    Serial.println(payload);
+    // ==========================
+    // Serial Monitor
+    // ==========================
+    Serial.println(F("--------------------------------"));
 
-    vTaskDelay(pdMS_TO_TICKS(5000));
-  }
-}
+    Serial.print(F("Temperature : "));
+    Serial.print(t, 1);
+    Serial.println(F(" °C"));
 
-//====================================================
-// Setup
-//====================================================
-void setup()
-{
-  Serial.begin(9600);
+    Serial.print(F("Humidity    : "));
+    Serial.print(h, 1);
+    Serial.println(F(" %"));
 
-  while (!Serial);
+    Serial.print(F("JSON        : "));
+    Serial.println(message);
 
-  Serial.println();
-  Serial.println("Starting System...");
+    Serial.print(F("Packet Size : "));
+    Serial.print(TOTAL_LEN);
+    Serial.println(F(" Byte"));
 
-  dht.begin();
+    Serial.print(F("LoRa Status : "));
+    if (status)
+        Serial.println(F("SEND OK"));
+    else
+        Serial.println(F("SEND FAILED"));
 
-  if (!initLoRa())
-  {
-    while (1);
-  }
+    Serial.println(F("--------------------------------\n"));
 
-  xTaskCreate(
-    TaskReadDHT,
-    "ReadDHT",
-    128,
-    NULL,
-    2,
-    NULL);
-
-  xTaskCreate(
-    TaskLoRa,
-    "LoRaSend",
-    192,
-    NULL,
-    1,
-    NULL);
-
-  vTaskStartScheduler();
-}
-
-//====================================================
-// Loop
-//====================================================
-void loop()
-{
+    delay(5000);
 }
